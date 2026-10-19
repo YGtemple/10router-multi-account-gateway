@@ -10,10 +10,15 @@
  *   - 请求头: x-app-id + X-Ide-Token + X-Cloudide-Token + x-uid + trace 头
  *   - 请求体: { messages, model, config_name, function, stream:true }
  *             content 必须是 [{type:"text",text:"..."}]
+ *             tools[].function.parameters 必须是【字符串】（不是对象）
  *   - 响应:  SSE，事件含 { response: "正文增量", reasoning_content: "思考增量", tool_calls }
  *
  * ⚠ 重要修复：Trae 上游对「不存在的模型名」返回 HTTP 200 + content:null + usage全0，
  *   这会让上层 fallback 误判为成功而不切换。本网关在转发前校验模型名，未知模型直接 404。
+ *
+ * ⚠ 重要修复：Trae 上游要求 tools[].function.parameters 是 JSON 字符串，
+ *   而 OpenAI 标准是对象。原样透传会报 400:
+ *     cannot unmarshal object into Go struct field FunctionDefinition.tools.function.parameters of type string
  *
  * 用法: node trae-gateway.mjs [port]
  */
@@ -61,7 +66,7 @@ function loadAccounts() {
   } catch (e) {
     log('loadAccounts error:', e.message);
   }
-  // 按 userId 去重，保留最晚过期
+  // 按 userId 去重，保留最新
   const m = new Map();
   for (const a of out) {
     const prev = m.get(a.uid);
@@ -169,7 +174,8 @@ function toSoloMessages(messages) {
       content = content.map((p) => {
         if (typeof p === 'string') return { type: 'text', text: p };
         if (p?.type === 'text') return { type: 'text', text: String(p.text ?? '') };
-        return p; // 图片等保持原样
+        // 图片等保持原样
+        return p;
       });
     } else {
       content = [{ type: 'text', text: '' }];
@@ -181,6 +187,40 @@ function toSoloMessages(messages) {
 function pickFunction(modelId, catalogList) {
   const hit = catalogList.find((m) => m.id === modelId);
   return hit?.function || 'solo_work_remote';
+}
+
+// Trae 上游要求 tools[].function.parameters 是【JSON 字符串】，
+// 而 OpenAI 标准是【对象】。原样透传会报：
+//   cannot unmarshal object into Go struct field FunctionDefinition.tools.function.parameters of type string
+function toSoloTools(tools) {
+  if (!Array.isArray(tools)) return undefined;
+  const out = tools.map((t) => {
+    // 兼容两种入参形式：
+    //   { type:'function', function:{...} }
+    //   { name, description, parameters }  （扁平形式）
+    const fn = t?.function || t;
+    if (!fn || typeof fn !== 'object') return null;
+    const raw = fn.parameters;
+    let params;
+    if (typeof raw === 'string') {
+      params = raw;                                  // 已是字符串，原样
+    } else if (raw && typeof raw === 'object') {
+      params = JSON.stringify(raw);                  // 对象 → 字符串
+    } else {
+      params = JSON.stringify({ type: 'object', properties: {} });
+    }
+    const item = {
+      type: 'function',
+      function: {
+        name: String(fn.name || ''),
+        description: String(fn.description || ''),
+        parameters: params,
+      },
+    };
+    if (fn.strict !== undefined) item.function.strict = fn.strict;
+    return item;
+  }).filter(Boolean);
+  return out.length ? out : undefined;
 }
 
 // ---------- SOLO 事件 → OpenAI ----------
@@ -197,6 +237,7 @@ function makeChunk(id, model, delta, finish = null, usage = null) {
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
 
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
@@ -249,9 +290,8 @@ const server = createServer(async (req, res) => {
 
     const modelId = input.model || 'Doubao-Seed-2.1-Turbo';
 
-    // ⚠ 关键修复：模型名校验
+    // ⚠ 关键修复1：模型名校验
     // 上游对未知模型返回 200 + content:null + usage全0，会让 fallback 误判成功。
-    // 这里提前拦截，返回标准 404，让上层正确触发降级。
     const known = list.find((m) => m.id === modelId);
     if (!known) {
       log(`chat 未知模型: ${modelId}`);
@@ -267,6 +307,8 @@ const server = createServer(async (req, res) => {
     }
 
     const fn = pickFunction(modelId, list);
+    // ⚠ 关键修复2：tools.parameters 转成 JSON 字符串
+    const soloTools = toSoloTools(input.tools);
 
     const soloBody = {
       messages: toSoloMessages(input.messages),
@@ -274,7 +316,7 @@ const server = createServer(async (req, res) => {
       config_name: modelId,
       function: fn,
       stream: true,
-      ...(Array.isArray(input.tools) ? { tools: input.tools } : {}),
+      ...(soloTools ? { tools: soloTools } : {}),
       ...(typeof input.reasoning_effort === 'string' ? { reasoning_effort: input.reasoning_effort } : {}),
     };
 
@@ -354,7 +396,7 @@ const server = createServer(async (req, res) => {
         if (Array.isArray(ev.tool_calls) && ev.tool_calls.length) {
           toolCalls = ev.tool_calls;
         }
-        // SOLO 的 usage 可能是顶层字段（独立事件），不是嵌套 usage 对象
+        // SOLO 的 usage 可能是顶层平铺字段（独立事件），不是嵌套 usage 对象
         if (typeof ev.usage === 'object' && ev.usage !== null) {
           usage = ev.usage;
         } else if (typeof ev.prompt_tokens === 'number' || typeof ev.completion_tokens === 'number') {
