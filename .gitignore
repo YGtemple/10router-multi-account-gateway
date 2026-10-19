@@ -1,0 +1,39 @@
+# 依赖
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+
+# 运行时产物
+logs/
+*.log
+
+# 签到日记与状态（含账号 uid，不要提交）
+checkin-journal.json
+checkin-journal.json.*
+checkin-state.json
+
+# 账号凭证（绝对不能提交）
+credential.json
+accounts/
+*.token
+
+# 环境变量
+.env
+.env.local
+
+# 10Router 数据
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# 导出/统计文件（可含敏感信息）
+credits-ledger.json
+credits-state.json
+dsh-usage-rows.json
+export-accounts.json
+export-usage.json
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
